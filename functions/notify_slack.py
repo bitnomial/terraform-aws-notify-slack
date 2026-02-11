@@ -529,6 +529,118 @@ def parse_notification(message: Union[str, Dict[str, Any]], subject: Optional[st
     return format_default(message=message, subject=subject)
 
 
+# Maps legacy attachment colors to emoji indicators for Block Kit.
+# Block Kit has no equivalent of the colored left sidebar in legacy
+# attachments, so we use emoji as a visual severity/status indicator.
+COLOR_TO_EMOJI = {
+    "good": "🟢",
+    "#4BB543": "🟢",
+    "warning": "🟡",
+    "danger": "🔴",
+    "#777777": "⚪",
+    "#439FE0": "🔵",
+}
+
+
+def _color_emoji(color: Optional[str]) -> str:
+    """Map an attachment color value to an emoji indicator."""
+    if color is None:
+        return ""
+    return COLOR_TO_EMOJI.get(color, "")
+
+
+def attachment_to_blocks(attachment: Dict[str, Any]) -> list:
+    """Convert a legacy Slack attachment dict into a list of Block Kit blocks.
+
+    This is a conversion shim that allows the existing formatter functions
+    (which return attachment dicts) to remain unchanged while sending
+    messages using the newer Block Kit format.
+
+    Attachment properties mapped:
+    - color   -> emoji prefix on header (🔴🟡🟢 etc.)
+    - text    -> header block
+    - title   -> section block (below header, if both text and title present)
+    - fields  -> section blocks (short fields paired in 2-column layout)
+    """
+    blocks: list = []
+    color = attachment.get("color")
+    emoji = _color_emoji(color)
+
+    att_text = attachment.get("text", "")
+    title = attachment.get("title")
+
+    # Prefer title as header (more specific).  format_default is the only
+    # formatter that sets both text and title; its text is always the
+    # generic string "AWS notification", which is not worth showing.
+    header = title or att_text or ""
+    if header:
+        header_display = f"{emoji} {header}" if emoji else header
+        # Header block uses plain_text (no mrkdwn), max 150 chars
+        blocks.append({
+            "type": "header",
+            "text": {
+                "type": "plain_text",
+                "text": header_display.replace("`", "")[:150],
+            },
+        })
+
+    # Convert fields to section blocks
+    for field in attachment.get("fields", []):
+        field_title = field.get("title", "")
+        field_value = field.get("value", "")
+
+        if field_title and field_value:
+            field_text = f"*{field_title}*\n{field_value}"
+        elif field_title:
+            field_text = f"*{field_title}*"
+        else:
+            field_text = field_value
+
+        blocks.append({
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": field_text},
+        })
+
+    return blocks
+
+
+def attachment_to_plaintext(attachment: Dict[str, Any]) -> str:
+    """Convert a legacy Slack attachment dict into full plaintext.
+
+    This text is set as the top-level ``text`` field in the Slack payload.
+    When blocks are present, the ``text`` field is NOT rendered in chat but
+    IS available to the Slack MCP server, push notifications, search, and
+    accessibility tools.
+
+    The plaintext contains ALL information from the attachment so that the
+    message is fully machine-readable.
+    """
+    parts: list = []
+
+    title = attachment.get("title")
+    att_text = attachment.get("text", "")
+
+    # Prefer title first (more specific); skip att_text when both exist
+    # since it is the generic "AWS notification" from format_default.
+    if title:
+        parts.append(title)
+    if att_text and not title:
+        parts.append(att_text)
+
+    for field in attachment.get("fields", []):
+        field_title = field.get("title", "")
+        field_value = field.get("value", "")
+
+        if field_title and field_value:
+            parts.append(f"{field_title}: {field_value}")
+        elif field_title:
+            parts.append(field_title)
+        elif field_value:
+            parts.append(field_value)
+
+    return "\n".join(parts)
+
+
 def get_slack_message_payload(
     message: Union[str, Dict], region: str, subject: Optional[str] = None
 ) -> Dict:
@@ -561,7 +673,9 @@ def get_slack_message_payload(
         message = cast(Dict[str, Any], message)
         payload = {**payload, **message}
     else:
-        payload["attachments"] = [parse_notification(message, subject, region)]
+        attachment = parse_notification(message, subject, region)
+        payload["blocks"] = attachment_to_blocks(attachment)
+        payload["text"] = attachment_to_plaintext(attachment)
 
     return payload
 
